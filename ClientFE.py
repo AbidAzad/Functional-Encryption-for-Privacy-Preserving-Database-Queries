@@ -1,149 +1,110 @@
-# client.py
-import socket, sys, hashlib, sqlparse
+# ClientFE.py
+import socket, sys, hashlib, sqlparse, json
 from fe_scheme import decrypt
 
 def load_public_key():
-    try:
-        with open("public_key.txt", "r") as f:
-            lines = f.read().splitlines()
-            n = int(lines[0].strip())
-            g = int(lines[1].strip())
-            return (n, g)
-    except Exception as e:
-        print(f"[Client] Error loading public key: {e}")
-        sys.exit(1)
+    with open("public_key.txt") as f:
+        n, g = map(int, f.read().split())
+    return (n, g)
 
 def load_ta_rsa_pub():
-    try:
-        with open("ta_rsa_pub.txt", "r") as f:
-            lines = f.read().splitlines()
-            N = int(lines[0].strip())
-            e = int(lines[1].strip())
-            return (N, e)
-    except Exception as e:
-        print(f"[Client] Error loading TA RSA public key: {e}")
-        sys.exit(1)
+    with open("ta_rsa_pub.txt") as f:
+        N, e = map(int, f.read().split())
+    return (N, e)
 
 def get_fkey():
-    host = "localhost"
-    port = 8000
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
-        command = "GET_FKEY AGG"
-        print(f"[Client] Requesting functional key with command: {command}")
-        s.sendall(command.encode())
-        data = s.recv(4096)
-        fkey = data.decode().strip()
-        print(f"[Client] Received functional key: {fkey}")
-        return fkey
+    with socket.socket() as s:
+        s.connect(("localhost",8000))
+        s.sendall(b"GET_FKEY AGG")
+        return s.recv(4096).decode().strip()
 
-def validate_and_parse_query(query):
-    parsed = sqlparse.parse(query)
-    if not parsed:
-        raise ValueError("Invalid SQL query.")
-    statement = parsed[0]
-    if statement.get_type() != "SELECT":
-        raise ValueError("Only SELECT queries are allowed.")
-    return True
-
-def send_query_to_server(fkey, query):
-    host = "localhost"
-    port = 9000
-    message = f"QUERY\n{fkey}\n{query}"
-    print(f"[Client] Sending query message to server:\n{message}")
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
-        s.sendall(message.encode())
-        data = s.recv(4096)
-        response = data.decode().strip()
-        print(f"[Client] Received response from server: {response}")
-        return response
-
-def verify_fkey(fkey_full, rsa_pub):
-    if "|" not in fkey_full:
+def verify_fkey(token, rsa_pub):
+    if "|" not in token:
         return None
-    fkey_data, sig_str = fkey_full.split("|", 1)
+    data, sig = token.split("|",1)
     try:
-        signature = int(sig_str)
-    except ValueError:
+        sig = int(sig)
+    except:
         return None
-    import hashlib
     N, e = rsa_pub
-    h = int(hashlib.sha256(fkey_data.encode()).hexdigest(), 16) % N
-    h_from_sig = pow(signature, e, N)
-    if h == h_from_sig and "FKEY:AGG" in fkey_data:
-        try:
-            parts = fkey_data.split(";")
-            lam_part = [p for p in parts if p.startswith("lam:")][0]
-            mu_part = [p for p in parts if p.startswith("mu:")][0]
-            lam = int(lam_part.split(":")[1])
-            mu = int(mu_part.split(":")[1])
-            return (lam, mu)
-        except Exception as e:
-            print(f"[Client] Error parsing functional key: {e}")
-            return None
-    else:
+    h = int(hashlib.sha256(data.encode()).hexdigest(),16)%N
+    if pow(sig,e,N)!=h or "FKEY:AGG" not in data:
         return None
+    parts = dict(p.split(":",1) for p in data.split(";") if ":" in p)
+    return (int(parts["lam"]), int(parts["mu"]))
+
+def send_query(fkey, sql):
+    msg = "QUERY\n"+fkey+"\n"+sql
+    with socket.socket() as s:
+        s.connect(("localhost",9000))
+        s.sendall(msg.encode())
+        return s.recv(65536).decode()
+
+def validate_select(q):
+    parsed = sqlparse.parse(q)
+    if not parsed or parsed[0].get_type()!="SELECT":
+        raise ValueError("Only SELECT allowed.")
+
+def handle_response(resp, fkey, pk):
+    try:
+        obj = json.loads(resp)
+    except:
+        print("[Client] Bad response:", resp)
+        return
+
+    mode = obj.get("mode")
+    if mode=="FE":
+        fn = obj["fn"]
+        if fn=="AVG":
+            s = decrypt(int(obj["sum"]), fkey, pk)
+            c = obj["count"]
+            print(f"AVG = {s}/{c} = {s/c:.2f}")
+        else:
+            cipher = int(obj["cipher"])
+            val = decrypt(cipher, fkey, pk)
+            print(f"{fn} = {val}")
+
+    elif mode=="SSE":
+        cols = obj["columns"]
+        nums = obj["numeric_cols"]
+        rows = obj["results"]
+        print("[Client] SSE‐fallback results:")
+        print("\t".join(cols))
+        for r in rows:
+            out = []
+            for c,cell in zip(cols,r):
+                if c in nums:
+                    out.append(str(decrypt(int(cell), fkey, pk)))
+                else:
+                    out.append(str(cell))
+            print("\t".join(out))
+
+    else:
+        print("[Client] Error or unknown mode:", obj)
 
 def main():
-    print("[Client] Functional Encryption Client started.")
+    print("[Client] Starting…")
     public_key = load_public_key()
-    rsa_pub = load_ta_rsa_pub()
-    fkey_full = get_fkey()
-    fkey = verify_fkey(fkey_full, rsa_pub)
+    rsa_pub    = load_ta_rsa_pub()
+    fkey_full  = get_fkey()
+    fkey       = verify_fkey(fkey_full, rsa_pub)
     if fkey is None:
-        print("[Client] Functional key verification failed. Exiting.")
-        sys.exit(1)
-    else:
-        print(f"[Client] Functional key verified: {fkey}")
+        print("Failed to verify FE key."); sys.exit(1)
+
     while True:
         try:
-            query = input("[Client] Enter SQL aggregation query: ")
-            if not query:
+            q = input("SQL> ").strip()
+            if not q: 
                 continue
-            print(f"[Client] You entered: {query}")
-            query_hash = hashlib.sha256(query.encode()).hexdigest()
-            print(f"[Client] Query hash (SHA256): {query_hash}")
             try:
-                validate_and_parse_query(query)
-            except Exception as e:
-                print(f"[Client] Query validation error: {str(e)}\n")
-                continue
-            response = send_query_to_server(fkey_full, query)
-            if response.startswith("ERROR"):
-                print(f"[Client] Error: {response}\n")
-                continue
-            # If AVG, response contains two lines: encrypted sum and plaintext count.
-            if "\n" in response:
-                lines = response.splitlines()
-                if len(lines) < 2:
-                    print("[Client] Error: Expected two values for AVG.\n")
-                    continue
-                try:
-                    agg_sum = int(lines[0].strip())
-                    count_plain = int(lines[1].strip())
-                except ValueError:
-                    print(f"[Client] Error: Server returned an error: {response}\n")
-                    continue
-                sum_result = decrypt(agg_sum, fkey, public_key)
-                if count_plain == 0:
-                    print("[Client] Error: Count is zero; cannot compute AVG.\n")
-                    continue
-                avg_result = sum_result / count_plain
-                print(f"[Client] Final result (AVG) decrypted locally: {avg_result}\n")
-            else:
-                try:
-                    agg_ciphertext = int(response)
-                except ValueError:
-                    print(f"[Client] Error: Server returned an error: {response}\n")
-                    continue
-                result = decrypt(agg_ciphertext, fkey, public_key)
-                print(f"[Client] Final result of query decrypted locally: {result}\n")
+                validate_select(q)
+            except ValueError as e:
+                print(e); continue
+            resp = send_query(fkey_full, q)
+            handle_response(resp, fkey, public_key)
         except KeyboardInterrupt:
-            print("\n[Client] Shutting down client.")
+            print("\nGoodbye.")
             sys.exit(0)
-        except Exception as e:
-            print(f"[Client] Error: {e}")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

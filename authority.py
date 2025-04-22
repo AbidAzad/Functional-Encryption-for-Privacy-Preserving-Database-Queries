@@ -36,8 +36,7 @@ def modinv(a, m):
     return x % m
 
 def rsa_sign(message, rsa_priv):
-    """Sign a message using RSA private key.
-       Signature is on the SHA-256 hash (reduced mod N)."""
+    """Sign a message using RSA private key."""
     N, e, d = rsa_priv
     h = int(hashlib.sha256(message.encode()).hexdigest(), 16) % N
     signature = pow(h, d, N)
@@ -66,52 +65,46 @@ def write_rsa_pub_to_file(rsa_pub):
 
 def start_authority_server():
     global rsa_priv, rsa_pub
+    # Generate Paillier keypair (public: n,g; private: λ,μ)
     public_key, private_key = keygen(256)
     print(f"[TA] Generated Paillier public key: n={public_key[0]}, g={public_key[1]}")
     write_public_key_to_file(public_key)
     print("[TA] Public key written to public_key.txt")
     
+    # Generate a small RSA keypair for signing FE‐keys
     rsa_priv = generate_rsa_keys(128)
     rsa_pub = (rsa_priv[0], rsa_priv[1])
-    print(f"[TA] Generated RSA keys for signing.")
     write_rsa_pub_to_file(rsa_pub)
-    print("[TA] RSA public key written to ta_rsa_pub.txt")
+    print("[TA] RSA keypair generated and public key written to ta_rsa_pub.txt")
     
-    host = "localhost"
-    port = 8000
+    host, port = "localhost", 8000
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, port))
         s.listen(5)
-        print(f"[TA] Authority server listening on {host}:{port}")
+        print(f"[TA] Listening on {host}:{port} for key requests...")
         while True:
             conn, addr = s.accept()
             with conn:
-                print(f"[TA] Connection from {addr}")
                 data = conn.recv(4096)
                 if not data:
                     continue
-                message = data.decode().strip()
-                print(f"[TA] Received: {message}")
-                if message == "GET_PUBLIC_KEY":
-                    response = f"{public_key[0]},{public_key[1]}"
-                    print(f"[TA] Sending public key: {response}")
-                    conn.sendall(response.encode())
-                elif message.upper() == "GET_FKEY AGG":
-                    # Package the functional key as: FKEY:AGG;lam:<lam>;mu:<mu>
+                cmd = data.decode().strip()
+                if cmd == "GET_PUBLIC_KEY":
+                    # Return Paillier public key
+                    resp = f"{public_key[0]},{public_key[1]}"
+                    conn.sendall(resp.encode())
+                elif cmd.upper() == "GET_FKEY AGG":
+                    # Issue the functional (decryption) key λ,μ for aggregation
                     lam, mu = private_key
                     fkey_data = f"FKEY:AGG;lam:{lam};mu:{mu}"
-                    signature = rsa_sign(fkey_data, rsa_priv)
-                    fkey_full = f"{fkey_data}|{signature}"
-                    print(f"[TA] Issuing functional key: {fkey_full}")
-                    conn.sendall(fkey_full.encode())
+                    sig = rsa_sign(fkey_data, rsa_priv)
+                    conn.sendall(f"{fkey_data}|{sig}".encode())
                 else:
-                    response = "ERROR: Unknown command."
-                    print("[TA] Unknown command received.")
-                    conn.sendall(response.encode())
+                    conn.sendall(b"ERROR: Unknown command.")
 
 if __name__ == "__main__":
     try:
         start_authority_server()
     except KeyboardInterrupt:
-        print("[TA] Authority server shutting down.")
+        print("\n[TA] Shutting down.")
         sys.exit(0)
