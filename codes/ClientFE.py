@@ -1,4 +1,10 @@
-import os, socket, hashlib, sqlparse, json
+# ClientFE.py
+
+import os
+import socket
+import hashlib
+import sqlparse
+import json
 from .fe_scheme import decrypt
 
 BASE_DIR = os.path.dirname(__file__)
@@ -15,17 +21,21 @@ def load_ta_rsa_pub():
     return (N, e)
 
 def get_fkey(query_hash: str) -> str:
-    """Request a function key from the Trusted Authority."""
     with socket.socket() as s:
         s.connect(("localhost", 8000))
         cmd = f"GET_FKEY AGG {query_hash}"
         s.sendall(cmd.encode())
-        raw = s.recv(4096).decode().strip()
-    return raw
+        return s.recv(4096).decode().strip()
+
+def get_sse_key() -> int:
+    with socket.socket() as s:
+        s.connect(("localhost", 8000))
+        s.sendall(b"GET_SSE_KEY")
+        return int(s.recv(4096).decode().strip())
 
 def verify_fkey(token: str, rsa_pub: tuple, expected_hash: str):
     """
-    Verify signature and that the token's embedded hash matches expected_hash.
+    Verify RSA signature on the function key.
     Returns (lam, mu) if valid, else None.
     """
     if "|" not in token:
@@ -39,28 +49,58 @@ def verify_fkey(token: str, rsa_pub: tuple, expected_hash: str):
     h = int(hashlib.sha256(data.encode()).hexdigest(), 16) % N
     if pow(sig, e, N) != h:
         return None
-    parts = dict(p.split(":", 1) for p in data.split(";") if ":" in p)
+    parts = dict(p.split(":",1) for p in data.split(";") if ":" in p)
     if parts.get("hash") != expected_hash:
         return None
     return (int(parts["lam"]), int(parts["mu"]))
 
 def send_query(fkey_token: str, sql: str) -> str:
-    """Send QUERY + token + SQL to the encrypted‐DB server."""
     msg = f"QUERY\n{fkey_token}\n{sql}"
+    chunks = []
     with socket.socket() as s:
         s.connect(("localhost", 9000))
         s.sendall(msg.encode())
-        return s.recv(65536).decode()
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    return b"".join(chunks).decode()
 
 def validate_select(q: str):
+    """
+    Ensure it's a single SELECT statement.
+    """
     parsed = sqlparse.parse(q)
     if not parsed or parsed[0].get_type() != "SELECT":
-        raise ValueError("Only SELECT statements are allowed.")
+        raise ValueError("Only single SELECT statements are allowed.")
 
-def handle_response(resp_json: str, fkey: tuple, public_key: tuple) -> str:
-    """Decrypt the FE result or decode the SSE fallback."""
-    obj  = json.loads(resp_json)
+def handle_response(resp_json: str,
+                    fkey: tuple,
+                    public_key: tuple,
+                    op: str = None,
+                    col: str = None,
+                    where: str = None) -> str:
+    """
+    - resp_json: raw JSON from the server
+    - fkey: (lam, mu) or (None,None)
+    - public_key: (n, g)
+    - op: "SUM", "COUNT", or "AVG"
+    - col: column name or "*"
+    - where: the WHERE clause string (without "WHERE"), or None
+
+    Returns a formatted string like:
+      [FE] SUM = <value>
+      [SSE] SUM = <value>
+    """
+    try:
+        obj = json.loads(resp_json)
+    except json.JSONDecodeError:
+        return resp_json
+
     mode = obj.get("mode")
+
+    # ---- Functional Encryption path ----
     if mode == "FE":
         fn = obj["fn"]
         if fn == "AVG":
@@ -71,20 +111,53 @@ def handle_response(resp_json: str, fkey: tuple, public_key: tuple) -> str:
             val = decrypt(int(obj["cipher"]), fkey, public_key)
             return f"[FE] {fn} = {val}"
 
-    elif mode == "SSE":
-        cols = obj["columns"]
-        nums = obj["numeric_cols"]
-        rows = obj["results"]
-        lines = ["[SSE-fallback] " + "\t".join(cols)]
-        for r in rows:
-            out = []
-            for c, v in zip(cols, r):
-                if c in nums:
-                    out.append(str(decrypt(int(v), fkey, public_key)))
-                else:
-                    out.append(v)
-            lines.append("\t".join(out))
-        return "\n".join(lines)
+    # ---- SSE fallback path ----
+    if mode == "SSE_TABLE":
+        # 1) decrypt the XOR‐encrypted rows
+        sse_key = get_sse_key()
+        cols    = obj["columns"]
+        enc_rows= obj["rows"]
+        dec_rows = []
+        for row in enc_rows:
+            dr = {
+                name: (int(cell) ^ sse_key)
+                for name, cell in zip(cols, row)
+            }
+            dec_rows.append(dr)
 
-    else:
-        return "ERROR: bad response"
+        # 2) apply WHERE filter if provided
+        if where:
+            import re
+            m = re.match(r"^(\w+)\s*(>=|<=|!=|<>|=|<|>)\s*(.+)$", where)
+            if m:
+                fld, op_sym, lit = m.groups()
+                lit = lit.strip("'\"")
+                # numeric literal?
+                try:
+                    lit = float(lit)
+                except:
+                    pass
+                ops = {
+                    "=": "==", "!=": "!=", "<>": "!=", 
+                    ">": ">", "<": "<", ">=": ">=", "<=": "<="
+                }
+                expr = ops[op_sym]
+                dec_rows = [
+                    r for r in dec_rows
+                    if eval(f"{r[fld]}{expr}{lit}")
+                ]
+
+        # 3) perform the aggregate locally
+        if op == "SUM":
+            result = sum(r[col] for r in dec_rows)
+        elif op == "COUNT":
+            result = len(dec_rows)
+        elif op == "AVG":
+            cnt = len(dec_rows)
+            result = (sum(r[col] for r in dec_rows)/cnt) if cnt else 0
+        else:
+            return f"ERROR: unknown op {op}"
+
+        return f"[SSE] {op} = {result}"
+
+    return f"ERROR: unknown mode {mode}"

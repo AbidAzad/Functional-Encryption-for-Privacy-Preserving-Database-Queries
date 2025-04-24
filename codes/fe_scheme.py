@@ -1,7 +1,10 @@
+# fe_scheme.py
+
 import random, math
 
 def is_prime(n, k=5):
-    if n < 2: return False
+    if n < 2:
+        return False
     for p in [2,3,5,7,11,13,17,19,23,29]:
         if n % p == 0:
             return n == p
@@ -11,7 +14,8 @@ def is_prime(n, k=5):
     for _ in range(k):
         a = random.randrange(2, n-1)
         x = pow(a, d, n)
-        if x in (1, n-1): continue
+        if x in (1, n-1):
+            continue
         for __ in range(s-1):
             x = pow(x, 2, n)
             if x == n-1:
@@ -44,7 +48,7 @@ def keygen(bits=256):
     """
     Paillier key generation.
     Returns (public_key, private_key):
-      public_key = (n, g)
+      public_key  = (n, g)
       private_key = (lam, mu)
     """
     p = generate_prime(bits//2)
@@ -58,19 +62,24 @@ def keygen(bits=256):
     return (n, g), (lam, mu)
 
 def encrypt(m, public_key):
-    """Paillier encrypt integer m under public_key."""
+    """
+    Paillier encrypt integer m under public_key.
+    Wraps m modulo n before encryption.
+    """
     n, g = public_key
     nsq = n*n
-    if not (0 <= m < n):
-        raise ValueError("Message out of range")
+    m_mod = int(m) % n
     while True:
         r = random.randrange(1, n)
         if math.gcd(r, n) == 1:
             break
-    return (pow(g, m, nsq) * pow(r, n, nsq)) % nsq
+    return (pow(g, m_mod, nsq) * pow(r, n, nsq)) % nsq
 
 def decrypt(c, private_key, public_key):
-    """Paillier decrypt c under (private_key, public_key)."""
+    """
+    Paillier decrypt c under (private_key, public_key).
+    Returns integer in [0, n).
+    """
     n, g = public_key
     nsq = n*n
     lam, mu = private_key
@@ -78,7 +87,9 @@ def decrypt(c, private_key, public_key):
     return ((x-1)//n * mu) % n
 
 def aggregate(ciphertexts, public_key):
-    """Homomorphic aggregation (multiplication) = encryption of sum."""
+    """
+    Homomorphic aggregation (multiplication) = encryption of sum.
+    """
     n, _ = public_key
     nsq = n*n
     agg = 1

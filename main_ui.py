@@ -1,16 +1,23 @@
+# main_ui.py
+
 import hashlib
 import os
 import threading
 import csv
 import re
 import json
+import sys
+import contextlib
+import shutil
+from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from codes import authority, ServerFE, ClientFE
-import contextlib
-import sys
 
-# ─── Redirect stdout into a Text widget (for Authority) ─────────────────────
+# ─── Delete codes/__pycache__ on startup ───────────────────────────────────
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "codes", "__pycache__")
+if os.path.isdir(CACHE_DIR):
+    shutil.rmtree(CACHE_DIR)
 
 class TextRedirector:
     def __init__(self, widget):
@@ -23,33 +30,29 @@ class TextRedirector:
 
 @contextlib.contextmanager
 def redirected_stdout(widget):
-    old = sys.stdout
-    sys.stdout = TextRedirector(widget)
+    old, sys.stdout = sys.stdout, TextRedirector(widget)
     try:
         yield
     finally:
         sys.stdout = old
-
-# ─── Trusted Authority Window ───────────────────────────────────────────────
 
 class AuthorityWindow(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("Authority")
         self.geometry("450x300")
-        self.log = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=("Segoe UI", 9))
+        self.log = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=("Segoe UI",9))
         self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         threading.Thread(target=self._run, daemon=True).start()
 
     def logger(self, msg):
-        self.log.insert(tk.END, msg + "\n")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.log.insert(tk.END, f"[{ts}] [TA] {msg}\n")
         self.log.see(tk.END)
 
     def _run(self):
         with redirected_stdout(self.log):
             authority.start_authority_server(logger=self.logger)
-
-# ─── Encrypted-DB Server Window ──────────────────────────────────────────────
 
 class ServerWindow(tk.Toplevel):
     def __init__(self, master, client):
@@ -58,137 +61,128 @@ class ServerWindow(tk.Toplevel):
         self.geometry("450x300")
         self.client = client
 
-        tk.Button(self, text="Choose CSV…", command=self.choose_csv).pack(pady=(10,0))
-        self.log = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=("Segoe UI", 9))
-        self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # a) store the button so we can disable it after upload
+        self.upload_btn = tk.Button(self, text="Upload Data", command=self.choose_csv)
+        self.upload_btn.pack(pady=(10,0))
 
-    def logger(self, msg):
-        self.log.insert(tk.END, msg + "\n")
-        self.log.see(tk.END)
+        self.log = scrolledtext.ScrolledText(self, wrap=tk.WORD, font=("Segoe UI",9))
+        self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
     def choose_csv(self):
         path = filedialog.askopenfilename(
-            initialdir=os.path.join(os.getcwd(), "data"),
-            filetypes=[("CSV Files", "*.csv")]
+            initialdir=os.getcwd()+"/data",
+            filetypes=[("CSV","*.csv")]
         )
         if not path:
             return
+
+        # b) disable the button once data is selected
+        self.upload_btn.config(state=tk.DISABLED)
+
         self.client.prepare(path)
         self.client.show_loading()
-        threading.Thread(target=lambda: self._serve(path), daemon=True).start()
 
-    def _serve(self, path):
         def wrap(msg):
-            self.logger(msg)
-            if "Listening on localhost:9000" in msg:
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.log.insert(tk.END, f"[{ts}] [Server] {msg}\n")
+            self.log.see(tk.END)
+            if "listening on localhost:9000" in msg.lower():
                 self.client.on_server_ready()
-        ServerFE.start_server(path, logger=wrap)
 
-# ─── Client Window ───────────────────────────────────────────────────────────
+        threading.Thread(
+            target=lambda: ServerFE.start_server(path, logger=wrap),
+            daemon=True
+        ).start()
 
 class ClientWindow(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("Data Client")
         self.geometry("700x500")
-        self.public_key = None
-        self.rsa_pub    = None
-        self.numeric_cols = []
-        self._ov = None
 
-        # Variables for Box View
-        self.query_var    = tk.StringVar()
-        self.fkey_var     = tk.StringVar()
-        self.lam_var      = tk.StringVar()
-        self.mu_var       = tk.StringVar()
-        self.cipher_var   = tk.StringVar()
-        self.result_var   = tk.StringVar()
+        self.public_key    = None
+        self.rsa_pub       = None
+        self.numeric_cols  = []
+        self._ov           = None
 
-        # ─── Mode toggle ───────────────────────────────────────
-        m = tk.Frame(self)
+        # ── Box‐view vars ───────────────────────────────────────
+        self.query_var     = tk.StringVar()
+        self.fkey_var      = tk.StringVar()
+        self.lam_var       = tk.StringVar()
+        self.mu_var        = tk.StringVar()
+        self.cipher_var    = tk.StringVar()
+        self.result_var    = tk.StringVar()
+
+        # ── Top controls ────────────────────────────────────────
+        top = tk.Frame(self)
         self.mode_var = tk.StringVar(value="console")
-        tk.Radiobutton(
-            m, text="Console View",
-            variable=self.mode_var, value="console",
-            command=self._switch
-        ).pack(side=tk.LEFT, padx=5)
-        tk.Radiobutton(
-            m, text="Box View",
-            variable=self.mode_var, value="boxes",
-            command=self._switch
-        ).pack(side=tk.LEFT, padx=5)
-        m.pack(fill=tk.X, pady=(10,5), padx=10)
+        tk.Radiobutton(top, text="Console View", variable=self.mode_var,
+                       value="console", command=self._switch).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(top, text="Box View", variable=self.mode_var,
+                       value="boxes", command=self._switch).pack(side=tk.LEFT, padx=5)
 
-        # ─── Operation & Column ─────────────────────────────────
-        of = tk.Frame(self)
-        tk.Label(of, text="Operation:", font=("Segoe UI",10)).pack(side=tk.LEFT)
+        tk.Label(top, text="Operation:", font=("Segoe UI",10)).pack(side=tk.LEFT, padx=(20,0))
         self.op_var = tk.StringVar(value="SUM")
-        self.op_menu = tk.OptionMenu(
-            of, self.op_var, "SUM","COUNT","AVG", command=self._rebuild
-        )
+        self.op_menu = tk.OptionMenu(top, self.op_var, "SUM","COUNT","AVG", command=self._rebuild_columns)
         self.op_menu.pack(side=tk.LEFT, padx=5)
 
-        tk.Label(of, text="Column:", font=("Segoe UI",10)).pack(side=tk.LEFT, padx=(20,0))
-        self.col_var = tk.StringVar(value="*")
-        self.col_menu = tk.OptionMenu(of, self.col_var, "*")
-        self.col_menu.pack(side=tk.LEFT, padx=5)
+        tk.Label(top, text="Column:", font=("Segoe UI",10)).pack(side=tk.LEFT, padx=(20,0))
+        self.col_frame = tk.Frame(top); self.col_frame.pack(side=tk.LEFT, padx=5)
+        self.col_var   = tk.StringVar(value="*")
+        self._build_col_menu(["*"])
 
-        self.send_btn = tk.Button(of, text="Send", state="disabled", command=self._send_async)
+        tk.Label(top, text="Filter:", font=("Segoe UI",10)).pack(side=tk.LEFT, padx=(20,0))
+        self.where_entry = tk.Entry(top); self.where_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+        self.send_btn = tk.Button(top, text="Send", state="disabled", command=self._send_async)
         self.send_btn.pack(side=tk.RIGHT)
-        of.pack(fill=tk.X, padx=10, pady=(0,10))
+        top.pack(fill=tk.X, pady=(10,5), padx=10)
 
-        # ─── Console View ─────────────────────────────────────────
+        # ── Console View ─────────────────────────────────────────
         self.console_frame = tk.Frame(self)
-        self.console = scrolledtext.ScrolledText(
-            self.console_frame, wrap=tk.WORD, font=("Segoe UI",9)
-        )
+        self.console = scrolledtext.ScrolledText(self.console_frame, wrap=tk.WORD, font=("Segoe UI",9))
         self.console.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         self.console_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ─── Box View ────────────────────────────────────────────
+        # ── Box View ────────────────────────────────────────────
         self.box_frame = tk.Frame(self)
-        # two columns of LabelFrames
-        # 1st row: Query | Function Key
-        self._card(self.box_frame, "Query Sent",    self.query_var, 0,0)
-        self._card(self.box_frame, "Function Key",  self.fkey_var,  0,1)
-        # 2nd row: λ  | μ
-        self._card(self.box_frame, "Key λ (λ)",     self.lam_var,    1,0)
-        self._card(self.box_frame, "Key μ (μ)",     self.mu_var,     1,1)
-        # 3rd row: Cipher spans 2 cols
-        self._card(self.box_frame, "Server Cipher", self.cipher_var,2,0, colspan=2)
-        # 4th row: Result spans 2 cols
-        self._card(self.box_frame, "Decrypted Result", self.result_var,3,0, colspan=2)
-
-        # grid config
-        for c in (0,1):
-            self.box_frame.grid_columnconfigure(c, weight=1)
-        for r in (2,3):
-            self.box_frame.grid_rowconfigure(r, weight=1)
-
+        for title,var,r,c,cs in [
+            ("Query Sent",       self.query_var,   0,0,1),
+            ("Function Key",     self.fkey_var,    0,1,1),
+            ("Key λ (λ)",        self.lam_var,     1,0,1),
+            ("Key μ (μ)",        self.mu_var,      1,1,1),
+            ("Server Cipher",    self.cipher_var,  2,0,2),
+            ("Decrypted Result", self.result_var,  3,0,2),
+        ]:
+            lf = tk.LabelFrame(self.box_frame, text=title,
+                               font=("Segoe UI",10,"bold"),
+                               bg="#f5f5f5", bd=1, relief="solid",
+                               labelanchor="n")
+            lf.grid(row=r, column=c, columnspan=cs,
+                    sticky="nsew", padx=5, pady=5)
+            lf.grid_columnconfigure(0, weight=1)
+            tk.Label(lf, textvariable=var, bg="#ffffff",
+                     anchor="nw", justify="left",
+                     wraplength=(650 if cs==2 else 300),
+                     font=("Segoe UI",9), padx=5, pady=5)\
+              .pack(fill=tk.BOTH, expand=True)
+        for c in (0,1): self.box_frame.grid_columnconfigure(c, weight=1)
+        for r in (2,3): self.box_frame.grid_rowconfigure(r, weight=1)
         self.box_frame.pack_forget()
-        self._set_state("disabled")
+        self._set_controls_state("disabled")
 
-    def _card(self, parent, title, var, row, col, colspan=1):
-        bg = "#f5f5f5"
-        inner = "#ffffff"
-        lf = tk.LabelFrame(
-            parent, text=title, font=("Segoe UI",10,"bold"),
-            bg=bg, fg="#333333", bd=1, relief="solid", labelanchor="n"
-        )
-        lf.grid(row=row, column=col, columnspan=colspan,
-                sticky="nsew", padx=5, pady=5)
-        lf.grid_columnconfigure(0, weight=1)
-        lbl = tk.Label(
-            lf, textvariable=var, bg=inner, anchor="nw", justify="left",
-            wraplength= (650 if colspan==2 else 300),
-            font=("Segoe UI",9), bd=1, relief="flat", padx=5, pady=5
-        )
-        lbl.pack(fill=tk.BOTH, expand=True)
+    def _build_col_menu(self, options):
+        for w in self.col_frame.winfo_children():
+            w.destroy()
+        default, rest = options[0], options[1:]
+        self.col_menu = tk.OptionMenu(self.col_frame, self.col_var, default, *rest)
+        self.col_menu.pack()
+        self.col_var.set(default)
 
-    def _set_state(self, st):
-        self.op_menu.config(state=st)
-        self.col_menu.config(state=st)
-        self.send_btn.config(state=st)
+    def _set_controls_state(self, s):
+        self.op_menu.config(state=s)
+        self.col_menu.config(state=s)
+        self.send_btn.config(state=s)
 
     def _switch(self):
         if self.mode_var.get() == "console":
@@ -198,46 +192,48 @@ class ClientWindow(tk.Toplevel):
             self.console_frame.pack_forget()
             self.box_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,10))
 
-    def _rebuild(self, *_):
-        opts = ["*"] if self.op_var.get()=="COUNT" else self.numeric_cols
-        m = self.col_menu["menu"]; m.delete(0, "end")
-        for o in opts:
-            m.add_command(label=o, command=lambda v=o: self.col_var.set(v))
-        if opts:
-            self.col_var.set(opts[0])
+    def _rebuild_columns(self, *_):
+        if self.op_var.get() == "COUNT":
+            opts = ["*"]
+        else:
+            opts = self.numeric_cols
+        self._build_col_menu(opts)
 
     def prepare(self, path):
-        # detect numeric cols
         with open(path, newline="", encoding="utf-8") as f:
             rdr = csv.reader(f)
-            hdr = next(rdr); hdr[0]=hdr[0].lstrip('\ufeff')
-            rows=[r for r in rdr if any(r)]
+            header = next(rdr)
+            header[0] = header[0].lstrip('\ufeff')
+            rows = [r for r in rdr if any(cell.strip() for cell in r)]
         self.numeric_cols = [
-            hdr[i] for i in range(len(hdr))
-            if all(re.match(r"^-?\d+(\.\d+)?$", r[i].strip())
-                   for r in rows if r[i].strip())
+            header[i]
+            for i in range(len(header))
+            if all(re.match(r"^-?\d+(\.\d+)?$", row[i].strip())
+                   for row in rows if row[i].strip())
         ]
+        self._rebuild_columns()
         try:
             self.public_key = ClientFE.load_public_key()
             self.rsa_pub    = ClientFE.load_ta_rsa_pub()
         except Exception as e:
             messagebox.showerror("Key Load Error", str(e))
-            return
-        self._rebuild()
 
     def on_server_ready(self):
         self.hide_loading()
-        self._set_state("normal")
+        self._set_controls_state("normal")
 
     def show_loading(self):
-        if getattr(self, "_ov", None): return
-        ov = tk.Toplevel(self); ov.overrideredirect(True)
-        ov.attributes("-alpha", 0.4); ov.configure(bg="gray")
-        x,y = self.winfo_rootx(), self.winfo_rooty()
-        w,h = self.winfo_width(), self.winfo_height()
+        if getattr(self, "_ov", None):
+            return
+        ov = tk.Toplevel(self)
+        ov.overrideredirect(True)
+        ov.attributes("-alpha", 0.4)
+        ov.configure(bg="gray")
+        x, y = self.winfo_rootx(), self.winfo_rooty()
+        w, h = self.winfo_width(), self.winfo_height()
         ov.geometry(f"{w}x{h}+{x}+{y}")
-        tk.Label(ov, text="Loading…", font=("Segoe UI",12,"bold"), bg="gray")\
-          .place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(ov, text="Loading…", font=("Segoe UI",12,"bold"),
+                 bg="gray").place(relx=0.5, rely=0.5, anchor="center")
         self._ov = ov
 
     def hide_loading(self):
@@ -245,71 +241,107 @@ class ClientWindow(tk.Toplevel):
             self._ov.destroy()
             self._ov = None
 
+    def _log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.console.insert(tk.END, f"[{ts}] [Client] {msg}\n")
+        self.console.see(tk.END)
+
     def _send_async(self):
         threading.Thread(target=self._send, daemon=True).start()
 
     def _send(self):
-        # Build SQL
+        import re
         op, col = self.op_var.get(), self.col_var.get()
-        if op=="COUNT" and col=="*":
+
+        # build SELECT
+        if op == "COUNT" and col == "*":
             q = "SELECT COUNT(*) FROM data;"
         else:
-            col_expr = col if re.match(r'^\w+$', col) else f'"{col}"'
+            if col == "*" or re.match(r"^\w+$", col):
+                col_expr = col
+            else:
+                col_expr = f'"{col}"'
             q = f"SELECT {op}({col_expr}) FROM data;"
 
-        # 1) Query
-        self.console.insert(tk.END, f"[Client] → Server: {q}\n")
-        self.console.see(tk.END)
+        # optional WHERE
+        filt = self.where_entry.get().strip()
+        if filt:
+            q = q.rstrip(";") + f" WHERE {filt};"
+
+        # validate
+        try:
+            ClientFE.validate_select(q)
+        except ValueError as e:
+            messagebox.showerror("Invalid Query", str(e))
+            return
+
+        self._log(f"→ Server: {q}")
         self.query_var.set(q)
 
-        # 2) GET_FKEY
+        # get FKEY
         h = hashlib.sha256(q.encode()).hexdigest()
-        self.console.insert(tk.END, f"[Client] ↔ TA: GET_FKEY AGG {h[:8]}…\n")
+        self._log(f"↔ TA: GET_FKEY AGG {h[:8]}…")
         raw = ClientFE.get_fkey(h)
-        self.console.insert(tk.END, f"[Client] ← TA token: {raw}\n\n")
-        self.console.see(tk.END)
+        self._log(f"← TA token: {raw}")
         self.fkey_var.set(raw)
 
-        # 3) Verify
         fk = ClientFE.verify_fkey(raw, self.rsa_pub, h)
         if not fk:
-            self.console.insert(tk.END, "[Client] ❌ invalid FKEY\n\n")
-            self.console.see(tk.END)
-            self.lam_var.set("Invalid")
-            self.mu_var.set("Invalid")
-            return
-        lam, mu = fk
-        self.console.insert(
-            tk.END, f"[Client] ✔ FKEY ok: λ={lam}, μ={mu}\n"
-        )
-        self.console.see(tk.END)
-        self.lam_var.set(str(lam))
-        self.mu_var.set(str(mu))
+            self._log("❌ invalid FKEY; SSE fallback")
+            self.lam_var.set("–")
+            self.mu_var.set("–")
+        else:
+            lam, mu = fk
+            self._log(f"✔ FKEY ok: λ={lam}, μ={mu}")
+            self.lam_var.set(str(lam))
+            self.mu_var.set(str(mu))
 
-        # 4) Server response
         resp = ClientFE.send_query(raw, q)
-        self.console.insert(
-            tk.END, f"[Client] ← Server raw response: {resp}\n"
-        )
-        self.console.see(tk.END)
+        self._log(f"← Server response ({len(resp)} bytes)")
+
         try:
             j = json.loads(resp)
-            cipher = j["sum"] if j.get("fn")=="AVG" else j.get("cipher", resp)
         except:
-            cipher = resp
-        self.cipher_var.set(str(cipher))
+            self.cipher_var.set(resp)
+            self.result_var.set("ERROR parsing response")
+            return
 
-        # 5) Decrypted result
-        out = ClientFE.handle_response(resp, fk, self.public_key)
-        self.console.insert(tk.END, f"[Client] Result: {out}\n\n")
-        self.console.see(tk.END)
-        self.result_var.set(out)
+        mode = j.get("mode")
 
-# ─── Main entrypoint ─────────────────────────────────────────────────────────
+        if mode == "FE":
+            self.cipher_var.set(str(j.get("cipher", j.get("sum", ""))))
+            out = ClientFE.handle_response(resp, fk, self.public_key)
+            self.result_var.set(out)
+            self._log(out)
+
+        elif mode == "SSE_TABLE":
+            out = ClientFE.handle_response(
+                resp,
+                fk or (None, None),
+                self.public_key,
+                op=self.op_var.get(),
+                col=self.col_var.get(),
+                where=self.where_entry.get().strip() or None
+            )
+            self.cipher_var.set("")  # no ciphertext box
+            self.result_var.set(out)
+            self._log(out)
+
+        else:
+            self._log(f"⚠ Unknown response mode: {mode}")
 
 def main():
     root = tk.Tk()
     root.withdraw()
+
+    # on exit, delete __pycache__ again
+    def on_close():
+        if os.path.isdir(CACHE_DIR):
+            shutil.rmtree(CACHE_DIR)
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
     AuthorityWindow(root)
     client = ClientWindow(root)
     ServerWindow(root, client)
