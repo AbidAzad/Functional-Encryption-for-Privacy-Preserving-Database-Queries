@@ -129,7 +129,6 @@ def rewrite_query(q, numeric_cols, logger):
     return "FE", fn, col
 
 def start_server(csv_path, logger):
-    logger("[Server] Listening on localhost:9000")
     public_key = load_public_key()
     rsa_pub    = load_ta_rsa_pub()
     header, numeric_cols, db_plain, db_enc = init_databases(csv_path, public_key, logger)
