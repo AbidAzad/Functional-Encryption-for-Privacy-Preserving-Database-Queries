@@ -61,7 +61,6 @@ class ServerWindow(tk.Toplevel):
         self.geometry("450x300")
         self.client = client
 
-        # a) store the button so we can disable it after upload
         self.upload_btn = tk.Button(self, text="Upload Data", command=self.choose_csv)
         self.upload_btn.pack(pady=(10,0))
 
@@ -76,7 +75,7 @@ class ServerWindow(tk.Toplevel):
         if not path:
             return
 
-        # b) disable the button once data is selected
+        # disable the button once data is selected
         self.upload_btn.config(state=tk.DISABLED)
 
         self.client.prepare(path)
@@ -98,10 +97,13 @@ class ClientWindow(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("Data Client")
-        self.geometry("700x500")
+        self.geometry("900x600")
+        self.minsize(800, 500)
 
         self.public_key    = None
         self.rsa_pub       = None
+        self.headers       = []
+        self.display_names = {}
         self.numeric_cols  = []
         self._ov           = None
 
@@ -163,15 +165,30 @@ class ClientWindow(tk.Toplevel):
             lf.grid_columnconfigure(0, weight=1)
             tk.Label(lf, textvariable=var, bg="#ffffff",
                      anchor="nw", justify="left",
-                     wraplength=(650 if cs==2 else 300),
-                     font=("Segoe UI",9), padx=5, pady=5)\
-              .pack(fill=tk.BOTH, expand=True)
-        for c in (0,1): self.box_frame.grid_columnconfigure(c, weight=1)
-        for r in (2,3): self.box_frame.grid_rowconfigure(r, weight=1)
+                     wraplength=(300 if cs==1 else 650),
+                     font=("Segoe UI",9), padx=5, pady=5).pack(fill=tk.BOTH, expand=True)
+
+        # new: Available Columns box
+        cols_lf = tk.LabelFrame(self.box_frame, text="Available Columns",
+                                font=("Segoe UI",10,"bold"),
+                                bg="#f5f5f5", bd=1, relief="solid",
+                                labelanchor="n")
+        cols_lf.grid(row=0, column=2, rowspan=4, sticky="nsew", padx=5, pady=5)
+        cols_lf.grid_columnconfigure(0, weight=1)
+        self.cols_label = tk.Label(cols_lf, text="", bg="#ffffff",
+                                   anchor="nw", justify="left",
+                                   font=("Segoe UI",9), padx=5, pady=5)
+        self.cols_label.pack(fill=tk.BOTH, expand=True)
+
+        for c in (0,1,2): self.box_frame.grid_columnconfigure(c, weight=1)
+        for r in (2,3):   self.box_frame.grid_rowconfigure(r, weight=1)
+
         self.box_frame.pack_forget()
         self._set_controls_state("disabled")
 
     def _build_col_menu(self, options):
+        if not options:
+            options = [""]
         for w in self.col_frame.winfo_children():
             w.destroy()
         default, rest = options[0], options[1:]
@@ -193,10 +210,16 @@ class ClientWindow(tk.Toplevel):
             self.box_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0,10))
 
     def _rebuild_columns(self, *_):
-        if self.op_var.get() == "COUNT":
-            opts = ["*"]
+        op = self.op_var.get()
+        if op == "COUNT":
+            opts = ["*"] + self.headers
+        elif op in ("SUM", "AVG"):
+            # original behavior: only numeric columns
+            opts = self.numeric_cols or []
         else:
-            opts = self.numeric_cols
+            opts = []
+        if not opts:
+            opts = [""]  # avoid empty list
         self._build_col_menu(opts)
 
     def prepare(self, path):
@@ -205,13 +228,20 @@ class ClientWindow(tk.Toplevel):
             header = next(rdr)
             header[0] = header[0].lstrip('\ufeff')
             rows = [r for r in rdr if any(cell.strip() for cell in r)]
+        self.headers = header
+        self.display_names = {c: c.replace("_"," ").title() for c in header}
+
         self.numeric_cols = [
-            header[i]
-            for i in range(len(header))
-            if all(re.match(r"^-?\d+(\.\d+)?$", row[i].strip())
-                   for row in rows if row[i].strip())
+            col for i,col in enumerate(header)
+            if all(re.match(r"^-?\d+(\.\d+)?$", r[i].strip()) for r in rows if r[i].strip())
         ]
+
+        # update Available Columns display
+        friendly = [self.display_names[c] for c in self.headers]
+        self.cols_label.config(text="\n".join(friendly))
+
         self._rebuild_columns()
+
         try:
             self.public_key = ClientFE.load_public_key()
             self.rsa_pub    = ClientFE.load_ta_rsa_pub()
@@ -319,8 +349,8 @@ class ClientWindow(tk.Toplevel):
                 resp,
                 fk or (None, None),
                 self.public_key,
-                op=self.op_var.get(),
-                col=self.col_var.get(),
+                op=op,
+                col=col,
                 where=self.where_entry.get().strip() or None
             )
             self.cipher_var.set("")  # no ciphertext box
