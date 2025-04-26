@@ -1,6 +1,6 @@
 # authority.py
 
-import os, glob, socket, sys, hashlib, math, random
+import os, glob, socket, hashlib, math, random
 from datetime import datetime
 from .fe_scheme import keygen, generate_prime
 
@@ -44,7 +44,10 @@ os.makedirs(KEY_DIR, exist_ok=True)
 for f in glob.glob(os.path.join(KEY_DIR, "*.txt")):
     os.remove(f)
 
-def start_authority_server(logger):
+def start_authority_server(logger, shutdown_event=None):
+    """
+    Blocks and serves on localhost:8000 until shutdown_event is set.
+    """
     def log(msg):
         ts = datetime.now().strftime("%H:%M:%S")
         logger(f"[{ts}] [Authority] {msg}")
@@ -74,12 +77,25 @@ def start_authority_server(logger):
     with socket.socket() as s:
         s.bind((host, port))
         s.listen(5)
+        s.settimeout(1.0)
         log(f"Listening on {host}:{port}")
         while True:
-            conn, addr = s.accept()
+            if shutdown_event and shutdown_event.is_set():
+                log("Shutdown signal received, exiting")
+                return
+            try:
+                conn, addr = s.accept()
+            except socket.timeout:
+                continue
+
             with conn:
+                # **NEW** ignore empty “handshake” connects
+                data = conn.recv(4096)
+                if not data:
+                    continue
+
+                data = data.decode().strip()
                 log(f"Connection from {addr}")
-                data = conn.recv(4096).decode().strip()
                 log(f"Received: {data!r}")
                 parts = data.split()
 
@@ -104,3 +120,45 @@ def start_authority_server(logger):
                 else:
                     conn.sendall(b"ERROR: Unknown command")
                     log("⚠ Unknown command")
+
+# ── Async helpers ─────────────────────────────────────────────────────────
+
+import threading, time
+
+_authority_thread   = None
+_authority_shutdown = None
+
+def start_authority_async(logger, host='localhost', port=8000, timeout=5.0):
+    """
+    Launch authority server in background. Returns once it's accepting.
+    """
+    global _authority_thread, _authority_shutdown
+    if _authority_thread and _authority_thread.is_alive():
+        raise RuntimeError("Authority server already running")
+    _authority_shutdown = threading.Event()
+    def target():
+        start_authority_server(logger, shutdown_event=_authority_shutdown)
+    _authority_thread = threading.Thread(target=target, daemon=True)
+    _authority_thread.start()
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                logger("[Authority] startup confirmed")
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise TimeoutError("Authority did not start in time")
+
+def stop_authority():
+    """
+    Signal authority to stop and wait for thread to join.
+    """
+    global _authority_thread, _authority_shutdown
+    if _authority_shutdown:
+        _authority_shutdown.set()
+    if _authority_thread:
+        _authority_thread.join()
+    _authority_thread   = None
+    _authority_shutdown = None
