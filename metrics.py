@@ -19,11 +19,10 @@ from simplefhe import (
     set_private_key,
     set_relin_keys,
     encrypt,
-    decrypt
-)  # simple-fhe usage :contentReference[oaicite:0]{index=0}
+    decrypt as sfhe_decrypt
+)
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 FIG_DIR  = os.path.join(os.path.dirname(__file__), "figures")
 os.makedirs(FIG_DIR, exist_ok=True)
@@ -76,48 +75,38 @@ DATASETS = {
 def logger(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-# ── Short label helper (fixed f-string) ───────────────────────────────────────
+# ── Utility: clean all “numeric” columns exactly as Paillier-FE does ──────────
+def clean_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in df.columns:
+        # strip non-digits, coerce to numeric, fill NaN→0, cast to int
+        cleaned = df[col].astype(str).str.replace(r"[^0-9\.\-]", "", regex=True)
+        nums    = pd.to_numeric(cleaned, errors="coerce")
+        if not nums.isna().all():
+            df[col] = nums.fillna(0).astype(int)
+    return df
 
+# ── SQL helpers ───────────────────────────────────────────────────────────────
 def shorten_label(q: str) -> str:
     parts = q.split("WHERE", 1)
-    sel  = parts[0].strip()
-    cond = parts[1].strip() if len(parts) == 2 else None
-
-    m = re.match(
-        r'SELECT\s+(SUM|COUNT|AVG)\(\s*(\*|"?([\w\s\.]+)"?)\)',
-        sel, re.IGNORECASE
-    )
-    if not m:
-        return q
-
-    op       = m.group(1).upper()
-    col_expr = m.group(2)
-
-    if op == "COUNT" and col_expr.strip() == "*":
+    sel, cond = parts[0].strip(), (parts[1].strip() if len(parts)==2 else None)
+    m = re.match(r'SELECT\s+(SUM|COUNT|AVG)\(\s*(\*|"?([\w\s\.]+)"?)\)', sel, re.IGNORECASE)
+    if not m: return q
+    op, col_expr = m.group(1).upper(), m.group(2)
+    if op=="COUNT" and col_expr.strip()=="*":
         base = "COUNT"
     else:
-        # strip any quotes, then abbreviate
-        col    = col_expr.strip().strip('"')
-        words  = re.findall(r"[A-Za-z]+", col)
-        abbr   = "".join(w[0] for w in words if len(w) > 2) or col[:3]
-        base   = f"{op}({abbr})"
-
+        col   = col_expr.strip().strip('"')
+        words = re.findall(r"[A-Za-z]+", col)
+        abbr  = "".join(w[0] for w in words if len(w)>2) or col[:3]
+        base  = f"{op}({abbr})"
     if cond:
-        cm = re.match(
-            r'^\s*"?([\w\s\.]+)"?\s*(>=|<=|!=|<>|=|<|>)\s*(.+)$',
-            cond
-        )
+        cm = re.match(r'^\s*"?([\w\s\.]+)"?\s*(>=|<=|!=|<>|=|<|>)\s*(.+)$', cond)
         if cm:
-            fld  = cm.group(1)
-            sym  = cm.group(2).replace("<>", "!=")
-            lit  = cm.group(3).strip().strip("'\"")
+            fld, sym, lit = cm.group(1), cm.group(2).replace("<>","!="), cm.group(3).strip().strip("'\"")
             words2 = re.findall(r"[A-Za-z]+", fld)
-            fabbr  = "".join(w[0] for w in words2 if len(w) > 2) or fld[:3]
+            fabbr  = "".join(w[0] for w in words2 if len(w)>2) or fld[:3]
             return f"{base}|{fabbr}{sym}{lit}"
-
     return base
-
-# ── SQL parsing for WHERE ──────────────────────────────────────────────────────
 
 def parse_condition(cond: str):
     pat = r'^\s*"?([\w\s\.]+)"?\s*(>=|<=|!=|<>|=|<|>)\s*(.+)$'
@@ -130,7 +119,6 @@ def parse_condition(cond: str):
     return fld, sym, float(lit) if re.fullmatch(r"[\d\.]+", lit) else lit
 
 # ── SimpleFHE microservice ─────────────────────────────────────────────────────
-
 _simplefhe_thread   = None
 _simplefhe_shutdown = None
 
@@ -157,12 +145,12 @@ def start_simplefhe_server_async(df: pd.DataFrame, port: int, logger):
                         conn.sendall(b'{"error":"bad format"}')
                         continue
                     sql = lines[1]
-                    res = _simplefhe_handle_query(sql, df)
-                    conn.sendall(json.dumps({"result": res}).encode())
+                    resp = {"result": _simplefhe_handle_query(sql, df)}
+                    conn.sendall(json.dumps(resp).encode())
 
     _simplefhe_thread = threading.Thread(target=serve, daemon=True)
     _simplefhe_thread.start()
-
+    # wait for it
     deadline = time.time() + 5
     while time.time() < deadline:
         try:
@@ -175,10 +163,8 @@ def start_simplefhe_server_async(df: pd.DataFrame, port: int, logger):
 
 def stop_simplefhe_server():
     global _simplefhe_thread, _simplefhe_shutdown
-    if _simplefhe_shutdown:
-        _simplefhe_shutdown.set()
-    if _simplefhe_thread:
-        _simplefhe_thread.join()
+    if _simplefhe_shutdown: _simplefhe_shutdown.set()
+    if _simplefhe_thread:  _simplefhe_thread.join()
     _simplefhe_thread   = None
     _simplefhe_shutdown = None
 
@@ -187,24 +173,21 @@ def send_simplefhe_query(sql: str, port: int) -> float:
     with socket.socket() as s:
         s.connect(("localhost", port))
         s.sendall(msg.encode())
-        data = b""
+        buf = b""
         while True:
             chunk = s.recv(4096)
             if not chunk:
                 break
-            data += chunk
-    obj = json.loads(data.decode())
-    if "result" in obj:
-        return float(obj["result"])
-    raise RuntimeError(f"SimpleFHE error: {obj}")
+            buf += chunk
+    obj = json.loads(buf.decode())
+    return float(obj["result"])
 
 def _simplefhe_handle_query(sql: str, df: pd.DataFrame) -> float:
-    q     = sql.strip().rstrip(";")
+    q = sql.strip().rstrip(";")
     parts = q.split("WHERE", 1)
-    sel   = parts[0].strip()
-    cond  = parts[1].strip() if len(parts)==2 else None
+    sel, cond = parts[0].strip(), (parts[1].strip() if len(parts)==2 else None)
 
-    # build the row mask as before
+    # build mask
     if cond:
         fld, sym, lit = parse_condition(cond)
         col = df[fld].astype(float)
@@ -212,102 +195,158 @@ def _simplefhe_handle_query(sql: str, df: pd.DataFrame) -> float:
     else:
         mask = pd.Series(True, index=df.index)
 
-    # COUNT(*) path unchanged …
-    if re.match(r"SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+data",
-                sel, re.IGNORECASE):
+    # COUNT(*)
+    if re.match(r"SELECT\s+COUNT\s*\(\s*\*\s*\)\s+FROM\s+data", sel, re.IGNORECASE):
         csum = None
         for _ in mask[mask].index:
             e = encrypt(1)
             csum = e if csum is None else (csum + e)
-        return 0.0 if csum is None else float(decrypt(csum))
+        return 0.0 if csum is None else float(sfhe_decrypt(csum))
 
-    # SUM/AVG path — **only this block changes**:
-    m = re.match(r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\)',
-                 sel, re.IGNORECASE)
+    # SUM/AVG
+    m = re.match(r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\)', sel, re.IGNORECASE)
     if not m:
         raise ValueError(f"Unrecognized query for SimpleFHE: {sql!r}")
     op, colname = m.group(1).upper(), m.group(2)
-
-    # ← HERE: drop NaNs before encrypting
     vals = df.loc[mask, colname].astype(float).dropna().tolist()
 
     csum = None
     for v in vals:
-        e = encrypt(int(v))     # now guaranteed v is a real number
+        e = encrypt(int(v))
         csum = e if csum is None else (csum + e)
-    total = 0.0 if csum is None else float(decrypt(csum))
+    total = 0.0 if csum is None else float(sfhe_decrypt(csum))
 
-    if op == "SUM":
-        return total
-    cnt = len(vals)
-    return (total / cnt) if cnt else 0.0
+    return total if op=="SUM" else (total/len(vals) if vals else 0.0)
 
-# ── Main runner ────────────────────────────────────────────────────────────────
-
-def run_metrics():
-    records = []
-
-    # existing FE/SSE imports
+# ── Quick Compare Routine ─────────────────────────────────────────────────────
+def compare_systems():
     from codes.authority import start_authority_async, stop_authority
     from codes.ServerFE    import start_server_async, stop_server
-    from codes.ClientFE    import (
-        get_fkey, send_query, verify_fkey,
-        load_ta_rsa_pub, load_public_key as fe_load_pub,
-        get_sse_key
-    )
+    from codes.ClientFE    import get_fkey, send_query, verify_fkey, load_ta_rsa_pub, load_public_key as fe_load_pub
     from codes.fe_scheme   import decrypt as fe_decrypt
 
+    print("\n=== Quick Compare: Paillier-FE vs SimpleFHE ===")
     for idx, (fname, queries) in enumerate(DATASETS.items()):
-        path = os.path.join(DATA_DIR, fname)
-        logger(f"\n=== Dataset: {fname} ===")
+        print(f"\n-- Dataset: {fname} --")
+        path     = os.path.join(DATA_DIR, fname)
+        df_full  = pd.read_csv(path)
+        df_clean = clean_numeric_columns(df_full.copy())
 
-        df_full    = pd.read_csv(path)
-        df_numeric = df_full.select_dtypes(include="number")
+        # ─ Determine proper BFV range ──────────────────────────────────
+        sum_cols = []
+        for q in queries:
+            m = re.match(r'SELECT\s+SUM\(\s*"?([\w\s\.]+)"?\)', q, re.IGNORECASE)
+            if m:
+                sum_cols.append(m.group(1))
+        if sum_cols:
+            max_int = max(int(df_clean[col].abs().sum()) for col in sum_cols) + 1
+        else:
+            max_int = 1
 
-        # init SimpleFHE context & keypair per-dataset
-        initialize("int")
+        # ─ Init SimpleFHE with enough range ───────────────────────────
+        initialize("int", max_int=max_int)
         pub, priv, relin = generate_keypair()
-        set_public_key(pub)
-        set_relin_keys(relin)
-        set_private_key(priv)
+        set_public_key(pub); set_relin_keys(relin); set_private_key(priv)
+        sf_port = 10000 + idx
+        start_simplefhe_server_async(df_clean, sf_port, logger)
 
-        # start SimpleFHE server on a new port
-        SF_PORT = 10000 + idx
-        start_simplefhe_server_async(df_numeric, SF_PORT, logger)
-
-        # start existing Paillier FE authority & server
+        # ─ Init Paillier-FE ───────────────────────────────────────────
         start_authority_async(logger)
         start_server_async(path, logger)
-
         rsa_pub = load_ta_rsa_pub()
         fe_pub  = fe_load_pub()
 
+        # ─ Compare each query ─────────────────────────────────────────
         for q in queries:
             h = hashlib.sha256(q.encode()).hexdigest()
 
+            # Paillier-FE execution
+            token = get_fkey(h)
+            resp  = send_query(token, q)
+            obj   = json.loads(resp)
+            if obj.get("mode")=="FE":
+                if obj["fn"] in ("SUM","COUNT"):
+                    fe_val = fe_decrypt(int(obj["cipher"]),
+                                        verify_fkey(token, rsa_pub, h),
+                                        fe_pub)
+                else:
+                    s, c = int(obj["sum"]), obj["count"]
+                    s_val = fe_decrypt(s, verify_fkey(token, rsa_pub, h), fe_pub)
+                    fe_val = (s_val/c) if c else 0.0
+            else:
+                fe_val = None
+
+            # SimpleFHE execution
+            sf_val = send_simplefhe_query(q, sf_port)
+
+            print(f"Query: {q!r}")
+            print(f"  Paillier-FE result = {fe_val}")
+            print(f"  SimpleFHE   result = {sf_val}\n")
+
+        # ─ Shutdown services ──────────────────────────────────────────
+        stop_server(); stop_authority(); stop_simplefhe_server()
+
+# ── Full Benchmark + Plotting ──────────────────────────────────────────────────
+def run_metrics():
+    from codes.authority import start_authority_async, stop_authority
+    from codes.ServerFE    import start_server_async, stop_server
+    from codes.ClientFE    import get_fkey, send_query, verify_fkey, load_ta_rsa_pub, load_public_key as fe_load_pub, get_sse_key
+    from codes.fe_scheme   import decrypt as fe_decrypt
+
+    records = []
+    for idx, (fname, queries) in enumerate(DATASETS.items()):
+        path     = os.path.join(DATA_DIR, fname)
+        df_full  = pd.read_csv(path)
+        df_clean = clean_numeric_columns(df_full.copy())
+
+        # ─ Determine proper BFV range ──────────────────────────────────
+        sum_cols = []
+        for q in queries:
+            m = re.match(r'SELECT\s+SUM\(\s*"?([\w\s\.]+)"?\)', q, re.IGNORECASE)
+            if m:
+                sum_cols.append(m.group(1))
+        if sum_cols:
+            max_int = max(int(df_clean[col].abs().sum()) for col in sum_cols) + 1
+        else:
+            max_int = 1
+
+        # ─ Init SimpleFHE with enough range ───────────────────────────
+        initialize("int", max_int=max_int)
+        pub, priv, relin = generate_keypair()
+        set_public_key(pub); set_relin_keys(relin); set_private_key(priv)
+        sf_port = 10000 + idx
+        start_simplefhe_server_async(df_clean, sf_port, logger)
+
+        # ─ Init Paillier-FE ───────────────────────────────────────────
+        start_authority_async(logger)
+        start_server_async(path, logger)
+        rsa_pub = load_ta_rsa_pub()
+        fe_pub  = fe_load_pub()
+
+        # ─ Run N_RUNS benchmark ───────────────────────────────────────
+        for q in queries:
+            h = hashlib.sha256(q.encode()).hexdigest()
             fe_key_t, fe_q_rt = [], []
             fe_exec, fe_dec, fe_val = [], [], []
             sse_key_t, sse_q_rt = [], []
             sse_exec, sse_val = [], []
             fhe_rt, true_val  = [], []
 
-            parts = q.split("WHERE", 1)
+            parts = q.split("WHERE",1)
             cond_clause = parts[1].strip() if len(parts)==2 else None
 
-            for run_idx in range(N_RUNS):
-                # FE key fetch
+            for _ in range(N_RUNS):
+                # Paillier-FE: key fetch
                 t0 = time.time()
                 token = get_fkey(h)
-                t1 = time.time()
-                fe_key_t.append(t1 - t0)
+                fe_key_t.append(time.time() - t0)
 
-                # FE vs SSE request
+                # Paillier-FE vs SSE request
                 t2 = time.time()
                 resp_json = send_query(token, q)
-                t3 = time.time()
-                rtt = t3 - t2
-
+                rtt = time.time() - t2
                 obj = json.loads(resp_json)
+
                 if obj.get("mode") == "FE":
                     fe_q_rt.append(rtt)
                     fn = obj["fn"]
@@ -317,64 +356,51 @@ def run_metrics():
                         val  = fe_decrypt(ciph,
                                          verify_fkey(token, rsa_pub, h),
                                          fe_pub)
-                        dt1  = time.time()
-                        fe_dec.append(dt1 - dt0)
-                    else:
+                        fe_dec.append(time.time() - dt0)
+                    else:  # AVG
                         s, c = int(obj["sum"]), obj["count"]
-                        dt0   = time.time()
-                        sd    = fe_decrypt(s,
-                                           verify_fkey(token, rsa_pub, h),
-                                           fe_pub)
-                        dt1   = time.time()
-                        fe_dec.append(dt1 - dt0)
-                        val   = sd / c if c else 0.0
-
+                        dt0 = time.time()
+                        sd  = fe_decrypt(s,
+                                         verify_fkey(token, rsa_pub, h),
+                                         fe_pub)
+                        fe_dec.append(time.time() - dt0)
+                        val = sd / c if c else 0.0
                     fe_exec.append(rtt - fe_dec[-1])
                     fe_val.append(val)
-
                 else:
+                    # SSE path
                     sse_q_rt.append(rtt)
                     t4 = time.time()
                     sk = get_sse_key()
-                    t5 = time.time()
-                    sse_key_t.append(t5 - t4)
-
+                    sse_key_t.append(time.time() - t4)
                     cols, rows = obj["columns"], obj["rows"]
-                    decs = [{c: (int(v) ^ sk) for c,v in zip(cols,row)}
-                            for row in rows]
+                    # decrypt rows
+                    decs = [{c: (int(v) ^ sk) for c, v in zip(cols, row)} for row in rows]
+                    # apply WHERE
                     if cond_clause:
-                        fld,sym,lit = parse_condition(cond_clause)
-                        decs = [r for r in decs
-                                if eval(f"{r[fld]}{sym}{lit}")]
+                        fld, sym, lit = parse_condition(cond_clause)
+                        decs = [r for r in decs if eval(f"{r[fld]}{sym}{lit}")]
+                    # aggregate
                     if q.upper().startswith("SELECT COUNT"):
                         val = len(decs)
                     else:
-                        m2 = re.match(
-                            r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\s*\)',
-                            q, re.IGNORECASE)
+                        m2 = re.match(r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\s*\)', q, re.IGNORECASE)
                         op, col = m2.group(1).upper(), m2.group(2)
-                        if op=="SUM":
+                        if op == "SUM":
                             val = sum(r[col] for r in decs)
                         else:
                             cnt = len(decs)
-                            val = (sum(r[col] for r in decs)/cnt
-                                   if cnt else 0.0)
-
-                    t6 = time.time()
-                    sse_exec.append(t6 - t5)
+                            val = (sum(r[col] for r in decs)/cnt) if cnt else 0.0
+                    sse_exec.append(time.time() - t4)
                     sse_val.append(val)
 
                 # SimpleFHE baseline
                 tf0 = time.time()
-                tv  = send_simplefhe_query(q, SF_PORT)
-                tf1 = time.time()
-                fhe_rt.append(tf1 - tf0)
+                tv  = send_simplefhe_query(q, sf_port)
+                fhe_rt.append(time.time() - tf0)
                 true_val.append(tv)
 
-                if run_idx==0 and cond_clause:
-                    logger(f"[DEBUG] SimpleFHE baseline for `{q}`: {tv}")
-
-            # compute averages & record
+            # ─ Compute averages & errors ───────────────────────────────
             tvm    = np.mean(true_val)
             fe_k   = np.mean(fe_key_t)   if fe_key_t else np.nan
             fe_q   = np.mean(fe_q_rt)    if fe_q_rt else np.nan
@@ -392,117 +418,91 @@ def run_metrics():
             acc_sse = (1 - err_sse/tvm)   if (tvm and sse_val) else np.nan
 
             fhe_e = np.mean(fhe_rt)
+            mode  = "SSE" if sse_val else "FE"
 
-            mode = "SSE" if sse_val else "FE"
             records.append({
-                "dataset":           fname,
-                "query":             q,
-                "mode":              mode,
-                "fe_key_fetch_avg":  fe_k,
-                "fe_query_rt_avg":   fe_q,
-                "fe_exec_avg":       fe_e,
-                "fe_decrypt_avg":    fe_d,
-                "sse_key_fetch_avg": sse_k,
-                "sse_query_rt_avg":  sse_q,
-                "sse_exec_avg":      sse_e,
-                "fhe_exec_avg":      fhe_e,
-                "true_value":        tvm,
-                "err_fe":            err_fe,
-                "acc_fe":            acc_fe,
-                "err_sse":           err_sse,
-                "acc_sse":           acc_sse,
+                "dataset":          fname,
+                "query":            q,
+                "mode":             mode,
+                "fe_key_fetch_avg": fe_k,
+                "fe_query_rt_avg":  fe_q,
+                "fe_exec_avg":      fe_e,
+                "fe_decrypt_avg":   fe_d,
+                "sse_key_fetch_avg":sse_k,
+                "sse_query_rt_avg": sse_q,
+                "sse_exec_avg":     sse_e,
+                "fhe_exec_avg":     fhe_e,
+                "true_value":       tvm,
+                "err_fe":           err_fe,
+                "acc_fe":           acc_fe,
+                "err_sse":          err_sse,
+                "acc_sse":          acc_sse
             })
-            logger(
-                f"Q={shorten_label(q)!r} → mode={mode}, true={tvm:.2f}, "
-                f"err_FE={err_fe:.2e}, err_SSE={err_sse:.2e}"
-            )
 
-        # tear down everything
-        stop_server()
-        stop_authority()
-        stop_simplefhe_server()
+            logger(f"Q={shorten_label(q)!r} → mode={mode}, true={tvm:.2f}, "
+                   f"err_FE={err_fe:.2e}, err_SSE={err_sse:.2e}")
 
+        # ─ Shutdown services for this dataset ─────────────────────────
+        stop_server(); stop_authority(); stop_simplefhe_server()
+
+    # ─ Build DataFrame & Plot ────────────────────────────────────────────────
     df = pd.DataFrame(records)
 
-    # ── Plotting with nicer grid and unclipped annotations ───────────────────
+    # FE plots
     for ds, grp in df.groupby("dataset"):
-        # --- Paillier-FE vs SimpleFHE ---
         fe = grp[grp["mode"]=="FE"]
         if not fe.empty:
             x, w = np.arange(len(fe)), 0.25
             fig, ax = plt.subplots(figsize=(10,4))
-            # log y-axis
             ax.set_yscale("log")
-            # only major grid, light and dashed
             ax.grid(True, axis="y", which="major", linestyle="--", linewidth=0.7, alpha=0.7)
-
-            # bars
-            ax.bar(x - w, fe["fe_exec_avg"],    width=w, label="Paillier-FE: Execution")
-            ax.bar(x    , fe["fe_decrypt_avg"], width=w, label="Paillier-FE: Decryption")
-            ax.bar(x + w, fe["fhe_exec_avg"],   width=w, label="SimpleFHE: Execution")
-
-            # annotations just above each tallest bar
+            ax.bar(x-w, fe["fe_exec_avg"],    width=w, label="Paillier-FE: Exec")
+            ax.bar(x,   fe["fe_decrypt_avg"], width=w, label="Paillier-FE: Decrypt")
+            ax.bar(x+w, fe["fhe_exec_avg"],   width=w, label="SimpleFHE: Exec")
             for i, acc in enumerate(fe["acc_fe"]):
                 if not np.isnan(acc):
                     y = fe[["fe_exec_avg","fe_decrypt_avg","fhe_exec_avg"]].iloc[i].max()
-                    ax.text(i, y * 1.05, f"Acc: {acc*100:.1f}%",
-                            ha="center", va="bottom", fontsize=8)
-
-            # labels, legend, title
+                    ax.text(i, y*1.05, f"{acc*100:.1f}%", ha="center", va="bottom", fontsize=8)
             ax.set_xticks(x)
             ax.set_xticklabels([shorten_label(q) for q in fe["query"]],
                                rotation=45, ha="right")
             ax.set_xlabel("Query")
             ax.set_ylabel("Time (s, log scale)")
-            ax.set_title(f"{ds} — Paillier-FE vs SimpleFHE Execution Times")
+            ax.set_title(f"{ds} — Paillier-FE vs SimpleFHE")
             ax.legend(title="Method", loc="upper left")
-
-            # ensure annotations & title aren’t cut off
-            plt.tight_layout()
-            fig.subplots_adjust(top=0.88)
-
-            fig.savefig(os.path.join(FIG_DIR,
-                                     f"{ds.replace('.csv','')}_FE_vs_SFHE.png"))
+            plt.tight_layout(); fig.subplots_adjust(top=0.88)
+            fig.savefig(os.path.join(FIG_DIR, f"{ds.replace('.csv','')}_FE_vs_SFHE.png"))
             #plt.show()
 
-        # --- SSE vs SimpleFHE for WHERE clauses ---
+    # SSE plots
+    for ds, grp in df.groupby("dataset"):
         ss = grp[grp["mode"]=="SSE"]
         if not ss.empty:
             x, w = np.arange(len(ss)), 0.4
             fig, ax = plt.subplots(figsize=(10,4))
             ax.set_yscale("log")
             ax.grid(True, axis="y", which="major", linestyle="--", linewidth=0.7, alpha=0.7)
-
-            ax.bar(x - w/2, ss["sse_exec_avg"], width=w, label="SSE: Execution")
-            ax.bar(x + w/2, ss["fhe_exec_avg"], width=w, label="SimpleFHE: Execution")
-
+            ax.bar(x-w/2, ss["sse_exec_avg"], width=w, label="SSE: Exec")
+            ax.bar(x+w/2, ss["fhe_exec_avg"], width=w, label="SimpleFHE: Exec")
             for i, acc in enumerate(ss["acc_sse"]):
                 if not np.isnan(acc):
-                    y = max(ss["sse_exec_avg"].iloc[i],
-                            ss["fhe_exec_avg"].iloc[i])
-                    ax.text(i, y * 1.05, f"Acc: {acc*100:.1f}%",
-                            ha="center", va="bottom", fontsize=8)
-
+                    y = max(ss["sse_exec_avg"].iloc[i], ss["fhe_exec_avg"].iloc[i])
+                    ax.text(i, y*1.05, f"{acc*100:.1f}%", ha="center", va="bottom", fontsize=8)
             ax.set_xticks(x)
             ax.set_xticklabels([shorten_label(q) for q in ss["query"]],
                                rotation=45, ha="right")
-            ax.set_xlabel("Query (abbreviated)")
+            ax.set_xlabel("Query")
             ax.set_ylabel("Time (s, log scale)")
-            ax.set_title(f"{ds} — SSE vs SimpleFHE WHERE-Clause Execution")
+            ax.set_title(f"{ds} — SSE vs SimpleFHE WHERE")
             ax.legend(title="Method", loc="upper left")
-
-            plt.tight_layout()
-            fig.subplots_adjust(top=0.88)
-
-            fig.savefig(os.path.join(FIG_DIR,
-                                     f"{ds.replace('.csv','')}_SSE_vs_SFHE.png"))
+            plt.tight_layout(); fig.subplots_adjust(top=0.88)
+            fig.savefig(os.path.join(FIG_DIR, f"{ds.replace('.csv','')}_SSE_vs_SFHE.png"))
             #plt.show()
-
-
 
     return df
 
 if __name__ == "__main__":
+    #compare_systems()
     results = run_metrics()
     #results.to_csv("metrics_results.csv", index=False)
     #logger("Saved metrics to metrics_results.csv")
