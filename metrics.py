@@ -334,16 +334,15 @@ def run_metrics():
         df_full  = pd.read_csv(path)
         df_clean = clean_numeric_columns(df_full.copy())
 
-        # Determine BFV max_int from all SUM/AVG columns
-        sum_cols = []
+        # ─ Determine proper BFV range ──────────────────────────────────
+        sum_cols  = []
         for q in queries:
-            m = re.match(
-                r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\)',
-                q, re.IGNORECASE
-            )
+            m = re.match(r'SELECT\s+(SUM|AVG)\(\s*"?([\w\s\.]+)"?\)', q, re.IGNORECASE)
             if m:
                 sum_cols.append(m.group(2).strip().strip('"'))
-        max_int = max((int(df_clean[c].abs().sum()) for c in sum_cols), default=0) + 1
+        max_sum   = max((df_clean[c].abs().sum() for c in sum_cols), default=0)
+        max_count = len(df_clean)
+        max_int   = max(max_sum, max_count) + 1
 
         # Start SimpleFHE
         initialize("int", max_int=max_int)
